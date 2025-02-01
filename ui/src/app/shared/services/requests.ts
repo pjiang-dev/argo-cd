@@ -67,25 +67,45 @@ export default {
     },
 
     loadEventSource(url: string): Observable<string> {
-        return Observable.create((observer: Observer<any>) => {
-            let eventSource = new EventSource(`${apiRoot()}${url}`);
-            eventSource.onmessage = msg => observer.next(msg.data);
-            eventSource.onerror = e => () => {
-                observer.error(e);
-                onError.next(e);
-            };
+        return new Observable((observer: Observer<any>) => {
+            const fullUrl = `${apiRoot()}${url}`;
+            let eventSource: EventSource | null = null;
+            let interval: NodeJS.Timeout | null = null;
 
-            // EventSource does not provide easy way to get notification when connection closed.
-            // check readyState periodically instead.
-            const interval = setInterval(() => {
-                if (eventSource && eventSource.readyState === ReadyState.CLOSED) {
-                    observer.error('connection got closed unexpectedly');
+            // First, make a fetch request to check for errors
+            fetch(fullUrl).then(response => {
+                if (!response.ok) {
+                    return response.text().then(text => {
+                        observer.error({status: response.status, statusText: response.statusText, body: text});
+                    });
                 }
-            }, 500);
+
+                // If the response is ok, create and use the EventSource
+                eventSource = new EventSource(fullUrl);
+
+                eventSource.onmessage = msg => observer.next(msg.data);
+
+                eventSource.onerror = e => {
+                    observer.error(e);
+                    onError.next(e);
+                };
+
+                // EventSource does not provide easy way to get notification when connection closed.
+                // check readyState periodically instead.
+                interval = setInterval(() => {
+                    if (eventSource && eventSource.readyState === ReadyState.CLOSED) {
+                        observer.error('connection got closed unexpectedly');
+                    }
+                }, 500);
+            });
+
+            // Return a function to clean up the EventSource when the Observable is unsubscribed
             return () => {
                 clearInterval(interval);
-                eventSource.close();
-                eventSource = null;
+                if (eventSource) {
+                    eventSource.close();
+                    eventSource = null;
+                }
             };
         });
     }
