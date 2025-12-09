@@ -121,7 +121,7 @@ To test the annotation with two local Argo CD instances:
 ```bash
 # Install primary instance
 kubectl create namespace argocd
-kubectl apply -n argocd --server-side -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+kubectl apply -n argocd --server-side --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
 
 # Install secondary instance
 kubectl create namespace namespace-b
