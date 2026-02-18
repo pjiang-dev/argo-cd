@@ -52,7 +52,7 @@ func NewCommand() *cobra.Command {
 		selfServiceNotificationEnabled bool
 	)
 	command := cobra.Command{
-		Use:   "controller",
+		Use:   common.CommandNotifications,
 		Short: "Starts Argo CD Notifications controller",
 		RunE: func(_ *cobra.Command, _ []string) error {
 			ctx, cancel := context.WithCancel(context.Background())
@@ -150,13 +150,11 @@ func NewCommand() *cobra.Command {
 			sigCh := make(chan os.Signal, 1)
 			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 			wg := sync.WaitGroup{}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				s := <-sigCh
 				log.Printf("got signal %v, attempting graceful shutdown", s)
 				cancel()
-			}()
+			})
 
 			go ctrl.Run(ctx, processorsCount)
 			<-ctx.Done()
