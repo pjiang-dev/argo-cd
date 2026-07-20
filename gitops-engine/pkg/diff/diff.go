@@ -272,6 +272,17 @@ func removeWebhookMutation(predictedLive, live *unstructured.Unstructured, gvkPa
 	// Remove fields from predicted live that are not managed by the provided manager
 	nonArgoFieldsSet := predictedLiveFieldSet.Difference(managerFieldsSet)
 
+	// When a CRD field is x-kubernetes-preserve-unknown-fields with no declared
+	// child properties, ToFieldSet walks the value untyped and emits intermediate
+	// container paths (e.g. both .spec.configuration and .spec.configuration.value),
+	// while Kubernetes records only the owned leaf (.spec.configuration.value) in
+	// managedFields. The container path then lands in nonArgoFieldsSet, and
+	// RemoveItems on it would prune the whole subtree - including the manager-owned
+	// leaf - producing a false negative diff (see issue #28818). Exclude any path
+	// that is an ancestor of a field owned by the manager so owned descendants are
+	// never removed.
+	nonArgoFieldsSet = nonArgoFieldsSet.Difference(ancestorsOf(managerFieldsSet))
+
 	// Compare the predicted live with the live resource
 	comparison, err := typedLive.Compare(typedPredictedLive)
 	if err != nil {
@@ -304,6 +315,25 @@ func removeWebhookMutation(predictedLive, live *unstructured.Unstructured, gvkPa
 		return nil, fmt.Errorf("error converting live typedValue: expected map got %T", plu)
 	}
 	return &unstructured.Unstructured{Object: pl}, nil
+}
+
+// ancestorsOf returns the set of all strict ancestor (prefix) paths of the
+// members of the given set. For a set containing .spec.configuration.value it
+// returns {.spec, .spec.configuration}. The leaf paths themselves are not
+// included. This is used to protect container paths that sit above a
+// manager-owned leaf from being pruned during webhook-mutation filtering.
+func ancestorsOf(set *fieldpath.Set) *fieldpath.Set {
+	ancestors := fieldpath.NewSet()
+	set.Iterate(func(path fieldpath.Path) {
+		for i := 1; i < len(path); i++ {
+			// path[:i] is a strict prefix (ancestor) of path. Copy it so later
+			// appends by the caller cannot mutate the shared backing array.
+			prefix := make(fieldpath.Path, i)
+			copy(prefix, path[:i])
+			ancestors.Insert(prefix)
+		}
+	})
+	return ancestors
 }
 
 // filterOutCompositeKeyFields filters out fields that are part of composite keys in associative lists.

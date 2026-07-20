@@ -1404,6 +1404,131 @@ func TestServerSideDiff(t *testing.T) {
 	})
 }
 
+// buildGVKParserFromSwagger builds a GvkParser from an inline swagger v2 document.
+// This lets tests exercise custom resources whose schema is not present in the
+// built-in OpenAPI doc used by buildGVKParser (e.g. CRDs with
+// x-kubernetes-preserve-unknown-fields).
+func buildGVKParserFromSwagger(t *testing.T, swaggerYAML string) *managedfields.GvkParser {
+	t.Helper()
+	document, err := openapi_v2.ParseDocument([]byte(swaggerYAML))
+	require.NoErrorf(t, err, "error parsing swagger document")
+	models, err := openapiproto.NewOpenAPIData(document)
+	require.NoErrorf(t, err, "error building openapi data")
+	gvkParser, err := managedfields.NewGVKParser(models, false)
+	require.NoErrorf(t, err, "error building gvkParser")
+	return gvkParser
+}
+
+// TestServerSideDiffPreservedFields reproduces https://github.com/argoproj/argo-cd/issues/28818.
+//
+// For a CRD whose spec is x-kubernetes-preserve-unknown-fields: true with no
+// declared child properties (an opaque object), ToFieldSet walks the live value
+// untyped and emits intermediate map paths (e.g. both .spec.configuration and
+// .spec.configuration.value). Kubernetes, however, records only the owned leaf
+// path (.spec.configuration.value) in managedFields for argocd-controller - not
+// the parent container .spec.configuration. removeWebhookMutation therefore
+// classifies the parent as non-Argo and RemoveItems prunes the whole subtree,
+// silently discarding the manager-owned leaf and producing a false negative.
+func TestServerSideDiffPreservedFields(t *testing.T) {
+	const exampleSwagger = `
+swagger: "2.0"
+info:
+  title: test
+  version: v1.0.0
+paths: {}
+definitions:
+  io.example.v1.Example:
+    type: object
+    x-kubernetes-group-version-kind:
+      - group: example.io
+        version: v1
+        kind: Example
+    properties:
+      apiVersion:
+        type: string
+      kind:
+        type: string
+      metadata:
+        type: object
+        x-kubernetes-preserve-unknown-fields: true
+      spec:
+        type: object
+        x-kubernetes-preserve-unknown-fields: true
+`
+
+	manager := "argocd-controller"
+
+	// managedFields records only the owned leaf (.spec.configuration.value), not
+	// the parent containers .spec / .spec.configuration - this is what Kubernetes
+	// actually stores for a preserve-unknown-fields subtree.
+	predictedLiveJSON := `{
+		"apiVersion": "example.io/v1",
+		"kind": "Example",
+		"metadata": {
+			"name": "sample",
+			"namespace": "default",
+			"managedFields": [{
+				"manager": "argocd-controller",
+				"operation": "Apply",
+				"apiVersion": "example.io/v1",
+				"fieldsType": "FieldsV1",
+				"fieldsV1": {"f:spec":{"f:configuration":{"f:value":{}}}}
+			}]
+		},
+		"spec": {"configuration": {"value": "new"}}
+	}`
+
+	liveState := StrToUnstructured(`{
+		"apiVersion": "example.io/v1",
+		"kind": "Example",
+		"metadata": {"name": "sample", "namespace": "default"},
+		"spec": {"configuration": {"value": "old"}}
+	}`)
+	desiredState := StrToUnstructured(`{
+		"apiVersion": "example.io/v1",
+		"kind": "Example",
+		"metadata": {"name": "sample", "namespace": "default"},
+		"spec": {"configuration": {"value": "new"}}
+	}`)
+
+	buildOpts := func() []Option {
+		gvkParser := buildGVKParserFromSwagger(t, exampleSwagger)
+		dryRunner := mocks.NewServerSideDryRunner(t)
+		dryRunner.EXPECT().Run(mock.Anything, mock.AnythingOfType("*unstructured.Unstructured"), manager).
+			Return(predictedLiveJSON, nil)
+		return []Option{
+			WithGVKParser(gvkParser),
+			WithManager(manager),
+			WithServerSideDryRunner(dryRunner),
+		}
+	}
+
+	t.Run("default webhook mutation filtering retains manager-owned leaf under preserved parent", func(t *testing.T) {
+		t.Parallel()
+
+		result, err := serverSideDiff(t.Context(), desiredState, liveState, buildOpts()...)
+
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.True(t, result.Modified,
+			"desired differs from live at a manager-owned leaf; must report Modified even though the parent path is absent from managedFields")
+		assert.Contains(t, string(result.PredictedLive), "new",
+			"the owned leaf's desired value must survive webhook-mutation filtering")
+	})
+
+	t.Run("IncludeMutationWebhook=true reports the same difference", func(t *testing.T) {
+		t.Parallel()
+
+		opts := append(buildOpts(), WithIgnoreMutationWebhook(false))
+		result, err := serverSideDiff(t.Context(), desiredState, liveState, opts...)
+
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.True(t, result.Modified)
+		assert.Contains(t, string(result.PredictedLive), "new")
+	})
+}
+
 // buildSecret returns a core/v1 Secret as an *unstructured.Unstructured.
 func buildSecret(name, namespace string, data map[string]string, annotations map[string]string) *unstructured.Unstructured {
 	dataField := make(map[string]any, len(data))
